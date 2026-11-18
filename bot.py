@@ -18,16 +18,23 @@
 يعتمد على مكتبة python-telegram-bot (الإصدار 20+).
 """
 
+import asyncio
+import html
+import io
 import json
 import logging
 import os
 import threading
+import time
+from collections import deque
 from contextlib import contextmanager
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import (
     Update,
+    InputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ChatMemberUpdated,
@@ -42,7 +49,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.error import TelegramError
+from telegram.error import RetryAfter, TelegramError
 
 # ----------------------------------------------------------------------------
 # الإعدادات الأساسية - عدّلها قبل التشغيل
@@ -56,11 +63,73 @@ DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__))
 os.makedirs(DATA_DIR, exist_ok=True)
 DATA_FILE = os.path.join(DATA_DIR, "data.json")
 
+# النسخ الاحتياطي التلقائي (يُرسل لكل ADMIN_IDS). اجعل القيمة 0 لتعطيله.
+BACKUP_INTERVAL_HOURS = float(os.environ.get("BACKUP_INTERVAL_HOURS", "24"))
+BACKUP_TZ = os.environ.get("BACKUP_TZ", "Asia/Baghdad")
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+# 🔒 مكتبة httpx تطبع رابط الطلب كاملاً (ويحتوي توكن البوت) في اللوغ عند مستوى INFO → نخفيها
+for _noisy in ("httpx", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+# 🔒 حدود الحماية (يمكن تعديلها من متغيرات البيئة)
+RATE_LIMIT_MAX = int(os.environ.get("RATE_LIMIT_MAX", "15"))        # أقصى عدد رسائل
+RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))  # خلال كم ثانية
+MESSAGE_MAP_MAX = 5000      # أقصى عدد روابط الرد المحفوظة (الأقدم يُحذف تلقائياً)
+RESTORE_MAX_BYTES = 5 * 1024 * 1024
+_RATE: dict[int, deque] = {}
+_RATE_WARNED: dict[int, float] = {}
+
+
+def rate_limited(user_id: int) -> bool:
+    """True لو تجاوز المستخدم الحد المسموح (المطوّرون مستثنون)."""
+    if is_admin(user_id) or RATE_LIMIT_MAX <= 0:
+        return False
+    now = time.monotonic()
+    dq = _RATE.setdefault(user_id, deque())
+    while dq and now - dq[0] > RATE_LIMIT_WINDOW:
+        dq.popleft()
+    if len(dq) >= RATE_LIMIT_MAX:
+        return True
+    dq.append(now)
+    if len(_RATE) > 20000:  # منع تضخم الذاكرة
+        for uid in [u for u, d in _RATE.items() if not d or now - d[-1] > RATE_LIMIT_WINDOW]:
+            _RATE.pop(uid, None)
+    return False
+
+
+def ban_user_id(uid: int) -> bool:
+    """يحظر المستخدم. يرفض حظر المطوّرين (حتى لا يقفل المطوّر على نفسه). يرجع True لو تم."""
+    if is_admin(uid):
+        return False
+    if uid not in DATA["banned"]:
+        DATA["banned"].append(uid)
+        save_data(DATA)
+    return True
+
+
+def remember_message(admin_chat_id: int, forwarded_msg_id: int, user_id: int, user_msg_id: int) -> None:
+    """يحفظ ربط الرسالة المُوجّهة بالمستخدم. المفتاح يتضمن آيدي محادثة المطوّر لأن
+    message_id يتكرر بين المحادثات (وإلا قد يصل الرد لمستخدم خاطئ عند وجود أكثر من مطوّر)."""
+    mm = DATA["message_map"]
+    mm[f"{admin_chat_id}:{forwarded_msg_id}"] = {
+        "user_id": str(user_id),
+        "user_msg_id": user_msg_id,
+    }
+    while len(mm) > MESSAGE_MAP_MAX:
+        mm.pop(next(iter(mm)))
+
+
+def lookup_message(admin_chat_id: int, replied_msg_id: int):
+    mm = DATA["message_map"]
+    link = mm.get(f"{admin_chat_id}:{replied_msg_id}")
+    if link is None and len(ADMIN_IDS) == 1:
+        link = mm.get(str(replied_msg_id))  # مفاتيح النسخ القديمة (آمنة فقط مع مطوّر واحد)
+    return link
 
 # ----------------------------------------------------------------------------
 # تخزين البيانات (JSON بسيط - يمكن استبداله بقاعدة بيانات لاحقاً)
@@ -199,6 +268,7 @@ def main_admin_menu() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🚫 قائمة المحظورين", callback_data="banned_list"),
         ],
         [InlineKeyboardButton("⚙️ اعدادات أخرى للبوت", callback_data="other_settings")],
+        [InlineKeyboardButton("💾 نسخة احتياطية الآن", callback_data="backup_now")],
     ]
     return InlineKeyboardMarkup(buttons)
 
@@ -278,6 +348,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     user_id_str = str(user.id)
 
+    if rate_limited(user.id):
+        return
+
     if user.id not in DATA["banned"]:
         DATA["users"].setdefault(
             user_id_str,
@@ -337,6 +410,13 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = update.effective_user
     message = update.message
 
+    if rate_limited(user.id):
+        now = time.monotonic()
+        if now - _RATE_WARNED.get(user.id, 0) > RATE_LIMIT_WINDOW:
+            _RATE_WARNED[user.id] = now
+            await message.reply_text("⏳ أنت ترسل رسائل بسرعة كبيرة، انتظر قليلاً ثم حاول مرة أخرى.")
+        return
+
     if not DATA["settings"]["bot_enabled"] and not is_admin(user.id):
         await message.reply_text("🛑 البوت متوقف مؤقتاً، حاول لاحقاً.")
         return
@@ -355,8 +435,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # لو المُرسل هو المطوّر ويرد على رسالة موجّهة من مستخدم -> أرسل الرد لذلك المستخدم
     if is_admin(user.id) and message.reply_to_message:
-        replied_id = str(message.reply_to_message.message_id)
-        link = DATA["message_map"].get(replied_id)
+        link = lookup_message(message.chat_id, message.reply_to_message.message_id)
         if link:
             target_user_id = link["user_id"] if isinstance(link, dict) else link
             target_msg_id = link.get("user_msg_id") if isinstance(link, dict) else None
@@ -383,8 +462,8 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             if DATA["settings"]["show_identity"]:
                 header = (
                     f"📩 رسالة جديدة من:\n"
-                    f"الاسم: {user.first_name}\n"
-                    f"المعرف: @{user.username if user.username else 'لا يوجد'}\n"
+                    f"الاسم: {html.escape(user.first_name or '')}\n"
+                    f"المعرف: @{html.escape(user.username) if user.username else 'لا يوجد'}\n"
                     f"الأيدي: <code>{user.id}</code>"
                 )
                 await context.bot.send_message(chat_id=admin_id, text=header, parse_mode=ParseMode.HTML)
@@ -393,10 +472,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 from_chat_id=message.chat_id,
                 message_id=message.message_id,
             )
-            DATA["message_map"][str(forwarded.message_id)] = {
-                "user_id": str(user.id),
-                "user_msg_id": message.message_id,
-            }
+            remember_message(admin_id, forwarded.message_id, user.id, message.message_id)
             try:
                 await context.bot.edit_message_reply_markup(
                     chat_id=admin_id,
@@ -437,6 +513,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await query.answer()
 
+    if data == "backup_now":
+        await send_backup(context.bot, [user_id], auto=False)
+        return
+
     if data.startswith("replybtn:"):
         _, target_uid, target_msgid = data.split(":", 2)
         AWAITING_INPUT[user_id] = f"reply:{target_uid}:{target_msgid}"
@@ -449,10 +529,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if data.startswith("banbtn:"):
         _, target_uid = data.split(":", 1)
         tuid = int(target_uid)
-        if tuid not in DATA["banned"]:
-            DATA["banned"].append(tuid)
-            save_data(DATA)
-        await context.bot.send_message(chat_id=user_id, text=f"🚫 تم حظر المستخدم {tuid}.")
+        if ban_user_id(tuid):
+            await context.bot.send_message(chat_id=user_id, text=f"🚫 تم حظر المستخدم {tuid}.")
+        else:
+            await context.bot.send_message(chat_id=user_id, text="⚠️ لا يمكن حظر مطوّر.")
         return
 
     if data == "back_main":
@@ -612,10 +692,10 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif action == "ban":
         try:
             uid = int(text.strip())
-            if uid not in DATA["banned"]:
-                DATA["banned"].append(uid)
-                save_data(DATA)
-            await message.reply_text(f"🚫 تم حظر المستخدم {uid}.", reply_markup=back_kb())
+            if ban_user_id(uid):
+                await message.reply_text(f"🚫 تم حظر المستخدم {uid}.", reply_markup=back_kb())
+            else:
+                await message.reply_text("⚠️ لا يمكن حظر مطوّر.", reply_markup=back_kb())
         except ValueError:
             await message.reply_text("⚠️ آيدي غير صحيح.", reply_markup=back_kb())
 
@@ -635,14 +715,23 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         sent, failed = 0, 0
         for uid_str in list(DATA["users"].keys()):
             try:
-                await context.bot.copy_message(
-                    chat_id=int(uid_str),
-                    from_chat_id=message.chat_id,
-                    message_id=message.message_id,
-                )
+                try:
+                    await context.bot.copy_message(
+                        chat_id=int(uid_str),
+                        from_chat_id=message.chat_id,
+                        message_id=message.message_id,
+                    )
+                except RetryAfter as e:  # تيليجرام طلب الانتظار → ننتظر ونعيد المحاولة مرة واحدة
+                    await asyncio.sleep(e.retry_after + 1)
+                    await context.bot.copy_message(
+                        chat_id=int(uid_str),
+                        from_chat_id=message.chat_id,
+                        message_id=message.message_id,
+                    )
                 sent += 1
             except TelegramError:
                 failed += 1
+            await asyncio.sleep(0.05)  # ~20 رسالة/ثانية (حد تيليجرام 30) لتجنب الحظر
         DATA["stats"]["total_broadcasts"] += 1
         save_data(DATA)
         await message.reply_text(
@@ -684,11 +773,15 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not context.args:
         await update.message.reply_text("الاستخدام: /ban <user_id>")
         return
-    uid = int(context.args[0])
-    if uid not in DATA["banned"]:
-        DATA["banned"].append(uid)
-        save_data(DATA)
-    await update.message.reply_text(f"🚫 تم حظر {uid}.")
+    try:
+        uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ آيدي غير صحيح.")
+        return
+    if ban_user_id(uid):
+        await update.message.reply_text(f"🚫 تم حظر {uid}.")
+    else:
+        await update.message.reply_text("⚠️ لا يمكن حظر مطوّر.")
 
 
 async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -697,11 +790,97 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not context.args:
         await update.message.reply_text("الاستخدام: /unban <user_id>")
         return
-    uid = int(context.args[0])
+    try:
+        uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ آيدي غير صحيح.")
+        return
     if uid in DATA["banned"]:
         DATA["banned"].remove(uid)
         save_data(DATA)
     await update.message.reply_text(f"✅ تم فك حظر {uid}.")
+
+
+# ----------------------------------------------------------------------------
+# النسخ الاحتياطي (تلقائي + يدوي + استرجاع)
+# ----------------------------------------------------------------------------
+def build_backup(auto: bool = True):
+    tz = ZoneInfo(BACKUP_TZ)
+    now = datetime.now(tz)
+    raw = json.dumps(DATA, ensure_ascii=False, indent=2).encode("utf-8")
+    filename = f"bot_backup_{now.strftime('%Y%m%d_%H%M%S')}.json"
+    kind = "نسخة احتياطية تلقائية" if auto else "نسخة احتياطية يدوية"
+    caption = f"💾 {kind} — {BACKUP_TZ} {now.strftime('%H:%M %d-%m-%Y')}"
+    return raw, filename, caption
+
+
+async def send_backup(bot, chat_ids, auto: bool = True) -> None:
+    raw, filename, caption = build_backup(auto)
+    for chat_id in chat_ids:
+        try:
+            await bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(io.BytesIO(raw), filename=filename),
+                caption=caption,
+            )
+        except TelegramError as e:
+            logger.warning("Backup send failed for %s: %s", chat_id, e)
+
+
+async def backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ADMIN_IDS:
+        logger.warning("ADMIN_IDS is empty - skipping automatic backup.")
+        return
+    await send_backup(context.bot, ADMIN_IDS, auto=True)
+
+
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    await send_backup(context.bot, [update.effective_user.id], auto=False)
+
+
+async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """أرسل ملف النسخة الاحتياطية مع التعليق /restore لاسترجاعها."""
+    if not is_admin(update.effective_user.id):
+        return
+    try:
+        doc = update.message.document
+        if doc.file_size and doc.file_size > RESTORE_MAX_BYTES:
+            raise ValueError("file too large")
+        tg_file = await doc.get_file()
+        new = json.loads(bytes(await tg_file.download_as_bytearray()).decode("utf-8"))
+        if not isinstance(new, dict) or not isinstance(new.get("users"), dict) \
+                or not isinstance(new.get("settings"), dict):
+            raise ValueError("bad structure")
+        # 🔒 فحص أنواع الحقول حتى لا تُعطّل نسخة تالفة البوت
+        banned = new.get("banned", [])
+        if not isinstance(banned, list) or not all(isinstance(x, int) for x in banned):
+            raise ValueError("bad banned list")
+        if not isinstance(new.get("stats", {}), dict) or not isinstance(new.get("message_map", {}), dict):
+            raise ValueError("bad stats/message_map")
+        st = new["settings"]
+        for k in ("welcome_message", "auto_reply"):
+            if k in st and not isinstance(st[k], str):
+                raise ValueError(k)
+        for k in ("show_identity", "bot_enabled"):
+            if k in st and not isinstance(st[k], bool):
+                raise ValueError(k)
+        ch = st.get("force_sub_channels", [])
+        if not isinstance(ch, list) or not all(isinstance(x, str) for x in ch):
+            raise ValueError("bad channels")
+        new = _fill_defaults(new)
+    except Exception:
+        await update.message.reply_text("❌ الملف غير صالح كنسخة احتياطية لهذا البوت.")
+        return
+    # تحديث الذاكرة في مكانها (DATA مرجع عام) ثم الحفظ
+    DATA.clear()
+    DATA.update(new)
+    save_data(DATA)
+    await update.message.reply_text(
+        f"✅ تم استرجاع النسخة.\n👥 المستخدمون: {len(DATA['users'])}\n"
+        f"🚫 المحظورون: {len(DATA['banned'])}"
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -747,20 +926,35 @@ def main() -> None:
 
     app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("admin", admin_command))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("ban", ban_command))
-    app.add_handler(CommandHandler("unban", unban_command))
+    # 🔒 كل الأوامر والرسائل تُقبل في المحادثة الخاصة فقط (يمنع استغلال البوت بإضافته لمجموعات/قنوات)
+    private = filters.ChatType.PRIVATE
+    app.add_handler(CommandHandler("start", start, filters=private))
+    app.add_handler(CommandHandler("admin", admin_command, filters=private))
+    app.add_handler(CommandHandler("help", help_command, filters=private))
+    app.add_handler(CommandHandler("stats", stats_command, filters=private))
+    app.add_handler(CommandHandler("ban", ban_command, filters=private))
+    app.add_handler(CommandHandler("unban", unban_command, filters=private))
+    app.add_handler(CommandHandler("backup", backup_command, filters=private))
+    # يجب تسجيله قبل message_router حتى لا يُعامَل الملف كرسالة مستخدم عادية
+    app.add_handler(
+        MessageHandler(
+            private & filters.Document.FileExtension("json") & filters.CaptionRegex(r"^/restore"),
+            restore_command,
+        )
+    )
 
     app.add_handler(CallbackQueryHandler(button_handler))
 
     # أي رسالة (نص/صورة/فيديو/صوت/ملف...) غير الأوامر
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_router))
+    app.add_handler(MessageHandler(private & ~filters.COMMAND, message_router))
+
+    if BACKUP_INTERVAL_HOURS > 0 and app.job_queue:
+        interval = BACKUP_INTERVAL_HOURS * 3600
+        app.job_queue.run_repeating(backup_job, interval=interval, first=interval)
+        logger.info("Auto backup every %s hours.", BACKUP_INTERVAL_HOURS)
 
     logger.info("🚀 البوت يعمل الآن...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":
